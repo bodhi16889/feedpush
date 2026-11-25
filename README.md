@@ -14,6 +14,22 @@
 | 啟動到結束（同一台 Mac mini、本機 RSSHub、5 次中位數） | **13.7 ms** | 58.2 ms |
 | 輸出 | 逐行 byte 相同（實測 `diff` 為空） | — |
 
+## 安裝（預編好的執行檔）
+
+到 [Releases](https://github.com/bodhi16889/feedpush/releases/latest) 下載對應平台，旁邊附 `.sha256`：
+
+```bash
+# Apple Silicon
+curl -LO https://github.com/bodhi16889/feedpush/releases/latest/download/feedpush-aarch64-apple-darwin
+chmod +x feedpush-aarch64-apple-darwin && mv feedpush-aarch64-apple-darwin ~/bin/feedpush
+
+# Intel Mac
+curl -LO https://github.com/bodhi16889/feedpush/releases/latest/download/feedpush-x86_64-apple-darwin
+
+# Linux x86_64（static-pie，可直接丟 scratch image）
+curl -LO https://github.com/bodhi16889/feedpush/releases/latest/download/feedpush-x86_64-unknown-linux-musl
+```
+
 ## 用法
 
 ```bash
