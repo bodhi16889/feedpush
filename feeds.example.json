@@ -1,0 +1,19 @@
+{
+  "_note": "複製成 feeds.json 再改。route 對應自架 RSSHub（預設 http://127.0.0.1:1200）。keywords 留空＝全推。",
+  "feeds": [
+    {
+      "id": "hackernews",
+      "name": "Hacker News 熱門",
+      "route": "hackernews/best",
+      "enabled": true,
+      "keywords": []
+    },
+    {
+      "id": "cna-business",
+      "name": "中央社 產經",
+      "route": "cna/business",
+      "enabled": false,
+      "keywords": ["AI", "半導體", "晶片", "台股", "股市", "營收", "財報", "出口", "訂單", "央行", "升息", "匯率", "關稅", "併購", "IPO"]
+    }
+  ]
+}

@@ -1,0 +1,5 @@
+/target
+state/
+feeds.json
+*.log
+.DS_Store

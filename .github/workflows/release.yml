@@ -1,0 +1,54 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14          # Apple Silicon
+            target: aarch64-apple-darwin
+          - os: macos-13          # Intel
+            target: x86_64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo -S -p '' apt-get install -y musl-tools
+
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: package
+        run: |
+          mkdir -p out
+          cp target/${{ matrix.target }}/release/feedpush out/feedpush-${{ matrix.target }}
+          cd out && shasum -a 256 feedpush-* > feedpush-${{ matrix.target }}.sha256 || sha256sum feedpush-* > feedpush-${{ matrix.target }}.sha256
+
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          files: |
+            out/feedpush-${{ matrix.target }}
+            out/feedpush-${{ matrix.target }}.sha256
+          generate_release_notes: true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: feedpush-${{ matrix.target }}
+          path: out/*
