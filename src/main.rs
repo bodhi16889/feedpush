@@ -74,9 +74,9 @@ fn parse_args() -> Args {
     while i < argv.len() {
         match argv[i].as_str() {
             "--help" | "-h" => {
-                println!("feedpush 0.1.0 — RSSHub feed → 去重 → Telegram-ready 文字\n\n\
+                println!("feedpush {} — RSSHub feed → 去重 → Telegram-ready 文字\n\n\
 用法:\n  feedpush [--test] [--feed <id>] [--config <path>] [--base <url>]\n\n\
-選項:\n  --test            忽略去重，印出目前前 8 則\n  --feed <id>       只跑指定 feed（feeds.json 的 id）\n  --config <path>   指定 feeds.json（預設 ~/work/rss-feeds/feeds.json）\n  --base <url>      指定 RSSHub 位址（預設 http://127.0.0.1:1200）\n  -h, --help        顯示這份說明");
+選項:\n  --test            忽略去重，印出目前前 8 則\n  --feed <id>       只跑指定 feed（feeds.json 的 id）\n  --config <path>   指定 feeds.json（預設 ~/work/rss-feeds/feeds.json）\n  --base <url>      指定 RSSHub 位址（預設 http://127.0.0.1:1200）\n  -h, --help        顯示這份說明", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
             }
             "--test" => args.test = true,

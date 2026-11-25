@@ -1,6 +1,6 @@
 [package]
 name = "feedpush"
-version = "0.1.0"
+version = "0.1.3"
 edition = "2021"
 description = "RSSHub → Telegram digest (dedupe, no_agent friendly)"
 
