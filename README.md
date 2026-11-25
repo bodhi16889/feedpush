@@ -1,5 +1,7 @@
 # feedpush
 
+[![ci](https://github.com/bodhi16889/feedpush/actions/workflows/ci.yml/badge.svg)](https://github.com/bodhi16889/feedpush/actions/workflows/ci.yml)
+
 把自架 [RSSHub](https://github.com/DIYgod/RSSHub) 的 feed 抓下來、去重、輸出成可直接丟給 Telegram 的文字。單一執行檔，不需要 Python。
 
 給 cron / systemd timer 用的「watchdog」型工具：**沒有新項目就完全不輸出**，所以掛在每小時甚至每 10 分鐘都不會吵。
@@ -93,8 +95,21 @@ cronjob_manage action=create name="HN 日報" no_agent=true \
 
 ```bash
 cargo build --release      # target/release/feedpush
-cargo test                 # 目前 0 個測試：邏輯以 --test 對照 RSSHub 實跑驗證
+cargo test                 # 29 個單元測試（解析／關鍵字／去重／截斷／state／URL）
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
 ```
+
+測試涵蓋的都是「錯了自己不會發現」的地方：
+
+- RSS 2.0 `<item>` 與 Atom `<entry>` 解析、缺 link／空標題要跳過
+- 關鍵字過濾（大小寫不敏感、中文）
+- **去重不洩漏 backlog**：抓 20 則只推 8 則，第二輪同一批必須安靜，第三輪多 1 則只能推那 1 則
+- 同一批內重複 id 只算一次；`state.seen` 超過 400 筆要丟最舊的
+- 訊息超過 3800 字元要截斷並附「其餘」提示
+- state 檔壞掉要 fallback 成空 state，不能 panic
+
+CI（`.github/workflows/ci.yml`）在 push 到 main 與 PR 上跑 `fmt --check` + `clippy -D warnings` + `cargo test`；`release.yml` 只管 tag 發版。
 
 依賴：`ureq`（同步 HTTP + rustls）、`roxmltree`（唯讀 XML）、`serde_json`。沒有 tokio、沒有 clap。
 

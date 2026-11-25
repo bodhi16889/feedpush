@@ -18,6 +18,8 @@ use serde::{Deserialize, Serialize};
 const MAX_ITEMS: usize = 8;
 const MAX_CHARS: usize = 3800; // Telegram 上限 4096，留安全邊界
 const TIMEOUT_SECS: u64 = 25;
+/// 去重清單上限：超過就丟掉最舊的（cron 一天跑一次，400 筆約可回溯兩週）
+const SEEN_CAP: usize = 400;
 
 #[derive(Deserialize)]
 struct Config {
@@ -111,12 +113,19 @@ fn fetch(url: &str) -> Result<String, String> {
         .user_agent("Mozilla/5.0 (compatible; feedpush/0.1)")
         .build();
     match agent.get(url).call() {
-        Ok(resp) => resp
-            .into_string()
-            .map_err(|e| format!("讀取失敗: {e}")),
+        Ok(resp) => resp.into_string().map_err(|e| format!("讀取失敗: {e}")),
         Err(ureq::Error::Status(code, _)) => Err(format!("HTTP {code}")),
         Err(e) => Err(format!("連線失敗: {e}")),
     }
+}
+
+/// 把 base 與 route 接起來，兩邊多餘的斜線都吃掉
+fn feed_url(base: &str, route: &str) -> String {
+    format!(
+        "{}/{}",
+        base.trim_end_matches('/'),
+        route.trim_start_matches('/')
+    )
 }
 
 /// 解析 RSS 2.0（<item>）與 Atom（<entry>）最小交集：標題 + 連結
@@ -183,13 +192,34 @@ fn load_state(path: &Path) -> State {
         .unwrap_or_default()
 }
 
-fn save_state(path: &Path, mut state: State) -> io::Result<()> {
-    if state.seen.len() > 400 {
-        let keep = state.seen.len() - 400;
-        state.seen.drain(0..keep);
-    }
+fn save_state(path: &Path, state: State) -> io::Result<()> {
     let json = serde_json::to_string_pretty(&state)?;
     fs::write(path, json)
+}
+
+/// 合併「這次抓到的全部」進 state，並回傳這次要推的新項目。
+///
+/// 關鍵：**整批都標記已見，只推最新 limit 則**。若只標記推出去的那幾則，
+/// 沒推到的舊文章下一輪又會變成「新」的，backlog 會一天漏一則慢慢洗版。
+fn merge_state(mut state: State, fetched: &[Item], limit: usize) -> (State, Vec<Item>) {
+    let mut known: HashSet<String> = state.seen.iter().cloned().collect();
+    let mut fresh: Vec<Item> = Vec::new();
+
+    for it in fetched {
+        if known.insert(it.id.clone()) {
+            state.seen.push(it.id.clone());
+            if fresh.len() < limit {
+                fresh.push(it.clone());
+            }
+        }
+    }
+
+    if state.seen.len() > SEEN_CAP {
+        let drop_n = state.seen.len() - SEEN_CAP;
+        state.seen.drain(0..drop_n);
+    }
+    state.updated = "written".into();
+    (state, fresh)
 }
 
 fn build_message(feed: &Feed, items: &[Item]) -> String {
@@ -242,11 +272,7 @@ fn main() {
     let mut failures: Vec<String> = Vec::new();
 
     for feed in &feeds {
-        let url = format!(
-            "{}/{}",
-            args.base.trim_end_matches('/'),
-            feed.route.trim_start_matches('/')
-        );
+        let url = feed_url(&args.base, &feed.route);
         let body = match fetch(&url) {
             Ok(b) => b,
             Err(e) => {
@@ -274,25 +300,7 @@ fn main() {
             continue;
         }
 
-        let state = load_state(&path);
-        let seen: HashSet<&String> = state.seen.iter().collect();
-        let fresh: Vec<Item> = items
-            .iter()
-            .filter(|i| !seen.contains(&i.id))
-            .take(MAX_ITEMS)
-            .cloned()
-            .collect();
-
-        // 重要：把「這次抓到的全部」都記成已見，只推最新的 N 則。
-        // 只記有推的那幾則 → 舊文章會在下一輪變成「新」的，backlog 一則一則漏出來。
-        let mut merged = state;
-        let known: HashSet<String> = merged.seen.iter().cloned().collect();
-        for it in &items {
-            if !known.contains(&it.id) {
-                merged.seen.push(it.id.clone());
-            }
-        }
-        merged.updated = "written".into();
+        let (merged, fresh) = merge_state(load_state(&path), &items, MAX_ITEMS);
         if let Err(e) = save_state(&path, merged) {
             failures.push(format!("{}：寫入 state 失敗 {e}", feed.name));
         }
@@ -316,5 +324,318 @@ fn main() {
         for f in &failures {
             eprintln!("{f}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn feed(name: &str) -> Feed {
+        Feed {
+            id: "t".into(),
+            name: name.into(),
+            route: "t".into(),
+            enabled: true,
+            keywords: vec![],
+        }
+    }
+
+    fn item(id: &str, title: &str) -> Item {
+        Item {
+            id: id.into(),
+            title: title.into(),
+            link: id.into(),
+        }
+    }
+
+    fn items(n: usize) -> Vec<Item> {
+        (0..n)
+            .map(|i| item(&format!("https://example.com/{i}"), &format!("標題 {i}")))
+            .collect()
+    }
+
+    // ---------- XML 解析 ----------
+
+    #[test]
+    fn parses_rss_items_in_order() {
+        let xml = r#"<?xml version="1.0"?>
+        <rss><channel><title>頻道</title>
+          <item><title>第一則</title><link>https://a/1</link></item>
+          <item><title>第二則</title><link>https://a/2</link></item>
+        </channel></rss>"#;
+        let got = parse_items(xml).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].title, "第一則");
+        assert_eq!(got[0].id, "https://a/1");
+        assert_eq!(got[1].link, "https://a/2");
+    }
+
+    #[test]
+    fn parses_atom_entries_with_href() {
+        let xml = r#"<feed xmlns="http://www.w3.org/2005/Atom">
+          <entry><title>Atom 一</title><link href="https://b/1"/></entry>
+          <entry><title>Atom 二</title><link href="https://b/2"/></entry>
+        </feed>"#;
+        let got = parse_items(xml).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].id, "https://b/1");
+        assert_eq!(got[1].title, "Atom 二");
+    }
+
+    #[test]
+    fn skips_item_without_link() {
+        let xml = r#"<rss><channel>
+          <item><title>沒有連結</title></item>
+          <item><title>有連結</title><link>https://a/1</link></item>
+        </channel></rss>"#;
+        let got = parse_items(xml).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].title, "有連結");
+    }
+
+    #[test]
+    fn skips_item_with_empty_title() {
+        let xml = r#"<rss><channel>
+          <item><title>   </title><link>https://a/1</link></item>
+          <item><title>正常</title><link>https://a/2</link></item>
+        </channel></rss>"#;
+        let got = parse_items(xml).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, "https://a/2");
+    }
+
+    #[test]
+    fn trims_whitespace_in_title_and_link() {
+        let xml = r#"<rss><channel>
+          <item><title>
+            前後有空白
+          </title><link>  https://a/1  </link></item>
+        </channel></rss>"#;
+        let got = parse_items(xml).unwrap();
+        assert_eq!(got[0].title, "前後有空白");
+        assert_eq!(got[0].link, "https://a/1");
+    }
+
+    #[test]
+    fn ignores_non_item_nodes() {
+        let xml = r#"<rss><channel><item><title>x</title><link>https://a/1</link></item>
+          <title>頻道標題不該被當成項目</title></channel></rss>"#;
+        assert_eq!(parse_items(xml).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn invalid_xml_is_an_error() {
+        assert!(parse_items("<rss><channel>").is_err());
+    }
+
+    // ---------- 關鍵字過濾 ----------
+
+    #[test]
+    fn empty_keywords_match_everything() {
+        assert!(matches_keywords(&item("u", "任何標題"), &[]));
+    }
+
+    #[test]
+    fn keywords_are_case_insensitive() {
+        let kw = vec!["ai".to_string()];
+        assert!(matches_keywords(&item("u", "OpenAI ships GPT"), &kw));
+        assert!(matches_keywords(&item("u", "生成式 AI 新創"), &kw));
+    }
+
+    #[test]
+    fn chinese_keyword_matches() {
+        let kw = vec!["半導體".to_string(), "台股".to_string()];
+        assert!(matches_keywords(&item("u", "半導體景氣回溫"), &kw));
+        assert!(matches_keywords(&item("u", "台股收紅"), &kw));
+    }
+
+    #[test]
+    fn keyword_miss_is_filtered_out() {
+        let kw = vec!["半導體".to_string()];
+        assert!(!matches_keywords(&item("u", "永續獎得獎名單公布"), &kw));
+    }
+
+    // ---------- 訊息組裝 ----------
+
+    #[test]
+    fn message_has_header_and_bullets() {
+        let msg = build_message(&feed("測試台"), &items(2));
+        assert!(msg.starts_with("📰 測試台（2 則）"), "實際：{msg}");
+        assert_eq!(msg.matches("\n• ").count(), 2);
+        assert!(msg.contains("https://example.com/0"));
+    }
+
+    #[test]
+    fn short_message_is_not_truncated() {
+        let msg = build_message(&feed("x"), &items(2));
+        assert!(!msg.contains("其餘"));
+    }
+
+    #[test]
+    fn long_message_truncates_under_telegram_limit() {
+        let long: Vec<Item> = (0..200)
+            .map(|i| {
+                item(
+                    &format!("https://example.com/{i}"),
+                    &format!("很長的標題 {i} {}", "字".repeat(60)),
+                )
+            })
+            .collect();
+        let msg = build_message(&feed("x"), &long);
+        assert!(msg.contains("…（其餘請開 RSSHub 看）"), "應該截斷");
+        assert!(msg.len() <= MAX_CHARS, "實際長度 {}", msg.len());
+    }
+
+    // ---------- 去重（最會出錯的地方） ----------
+
+    #[test]
+    fn first_run_pushes_at_most_limit() {
+        let (state, fresh) = merge_state(State::default(), &items(20), 8);
+        assert_eq!(fresh.len(), 8, "只推最新 8 則");
+        assert_eq!(state.seen.len(), 20, "整批都要標記已見");
+    }
+
+    #[test]
+    fn second_run_is_silent() {
+        let batch = items(20);
+        let (state, _) = merge_state(State::default(), &batch, 8);
+        let (_, fresh) = merge_state(state, &batch, 8);
+        assert!(fresh.is_empty(), "同一批跑第二次不該再推");
+    }
+
+    #[test]
+    fn no_backlog_leak_when_feed_grows() {
+        // 第一輪 20 則（只推 8），第二輪原 20 則 + 1 則新的 → 只推新的那一則
+        let batch = items(20);
+        let (state, _) = merge_state(State::default(), &batch, 8);
+
+        let mut next = batch.clone();
+        next.push(item("https://example.com/new", "全新的那一則"));
+        let (state2, fresh) = merge_state(state, &next, 8);
+
+        assert_eq!(fresh.len(), 1, "只該有 1 則新的，實際 {}", fresh.len());
+        assert_eq!(fresh[0].id, "https://example.com/new");
+        assert_eq!(state2.seen.len(), 21);
+    }
+
+    #[test]
+    fn duplicate_ids_inside_one_batch_count_once() {
+        let dup = vec![item("https://a/1", "甲"), item("https://a/1", "甲（重複）")];
+        let (state, fresh) = merge_state(State::default(), &dup, 8);
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(state.seen, vec!["https://a/1".to_string()]);
+    }
+
+    #[test]
+    fn seen_list_is_capped_and_keeps_newest() {
+        let batch = items(500);
+        let (state, _) = merge_state(State::default(), &batch, 8);
+        assert_eq!(state.seen.len(), SEEN_CAP);
+        assert_eq!(state.seen.last().unwrap(), "https://example.com/499");
+        assert_eq!(
+            state.seen.first().unwrap(),
+            "https://example.com/100",
+            "應丟掉最舊的 100 筆"
+        );
+    }
+
+    #[test]
+    fn limit_zero_pushes_nothing_but_still_records() {
+        let (state, fresh) = merge_state(State::default(), &items(3), 0);
+        assert!(fresh.is_empty());
+        assert_eq!(state.seen.len(), 3);
+    }
+
+    #[test]
+    fn merge_marks_updated_field() {
+        let (state, _) = merge_state(State::default(), &items(1), 8);
+        assert_eq!(state.updated, "written");
+    }
+
+    #[test]
+    fn empty_fetch_keeps_state_untouched() {
+        let before = State {
+            seen: vec!["https://old/1".into()],
+            updated: "old".into(),
+        };
+        let (after, fresh) = merge_state(before, &[], 8);
+        assert!(fresh.is_empty());
+        assert_eq!(after.seen, vec!["https://old/1".to_string()]);
+    }
+
+    // ---------- state 檔 ----------
+
+    #[test]
+    fn state_json_roundtrip() {
+        let s = State {
+            seen: vec!["https://a/1".into(), "https://a/2".into()],
+            updated: "2026-11-25".into(),
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let back: State = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.seen, s.seen);
+        assert_eq!(back.updated, s.updated);
+    }
+
+    #[test]
+    fn state_tolerates_missing_fields() {
+        let s: State = serde_json::from_str("{}").unwrap();
+        assert!(s.seen.is_empty());
+        assert_eq!(s.updated, "");
+    }
+
+    #[test]
+    fn load_state_falls_back_to_default_on_broken_file() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("feedpush-broken-{}.json", std::process::id()));
+        fs::write(&path, "{ this is not json").unwrap();
+        assert!(load_state(&path).seen.is_empty());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn state_path_sits_next_to_config() {
+        let p = state_path(Path::new("/tmp/cfg/feeds.json"), "hn");
+        assert_eq!(p, PathBuf::from("/tmp/cfg/state/hn.json"));
+    }
+
+    // ---------- 設定檔 ----------
+
+    #[test]
+    fn config_defaults_enabled_true_and_empty_keywords() {
+        let cfg: Config =
+            serde_json::from_str(r#"{"feeds":[{"id":"a","name":"A","route":"a/b"}]}"#).unwrap();
+        assert!(cfg.feeds[0].enabled);
+        assert!(cfg.feeds[0].keywords.is_empty());
+    }
+
+    #[test]
+    fn config_reads_keywords_and_disabled_flag() {
+        let cfg: Config = serde_json::from_str(
+            r#"{"feeds":[{"id":"a","name":"A","route":"a/b","enabled":false,
+                 "keywords":["AI","半導體"]}]}"#,
+        )
+        .unwrap();
+        assert!(!cfg.feeds[0].enabled);
+        assert_eq!(cfg.feeds[0].keywords, vec!["AI", "半導體"]);
+    }
+
+    // ---------- URL ----------
+
+    #[test]
+    fn feed_url_joins_without_double_slash() {
+        assert_eq!(
+            feed_url("http://127.0.0.1:1200/", "/hackernews/best"),
+            "http://127.0.0.1:1200/hackernews/best"
+        );
+        assert_eq!(
+            feed_url("http://127.0.0.1:1200", "cna/business"),
+            "http://127.0.0.1:1200/cna/business"
+        );
+        assert_eq!(
+            feed_url("https://rsshub.example.com", "/cna/business/"),
+            "https://rsshub.example.com/cna/business/"
+        );
     }
 }
