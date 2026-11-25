@@ -16,7 +16,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14          # Apple Silicon
+          - os: macos-latest      # Apple Silicon（macos-14 在免費 runner 標籤不受支援）
             target: aarch64-apple-darwin
           - os: macos-13          # Intel
             target: x86_64-apple-darwin
